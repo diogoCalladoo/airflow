@@ -2064,9 +2064,12 @@ class DagRun(Base, LoggingMixin):
         schedulable_ti_ids: list[UUID] = []
         debug_try_number_check = self.log.isEnabledFor(logging.DEBUG)
         expected_try_number_by_ti_id: dict[UUID, tuple[int, int, str | None]] = {}
+        max_ti_poke_interval = 0
         for ti in schedulable_tis:
             if ti.is_schedulable:
                 schedulable_ti_ids.append(ti.id)
+                if(hasattr(ti.task, "poke_interval")):
+                    max_ti_poke_interval = max(max_ti_poke_interval, ti.task.poke_interval)
                 if debug_try_number_check:
                     expected_try_number_by_ti_id[ti.id] = (
                         ti.try_number
@@ -2102,18 +2105,38 @@ class DagRun(Base, LoggingMixin):
                 schedulable_ti_ids, max_tis_per_query or len(schedulable_ti_ids)
             )
             for id_chunk in schedulable_ti_ids_chunks:
+                from airflow.models.taskreschedule import TaskReschedule
+                from datetime import timedelta
+                from sqlalchemy import exists
+
+                # Default reschedule window is 2 minutes, 
+                # which means if there is a reschedule record within 2 minutes before or after the current time, 
+                # we consider it as a recent reschedule and do not increase the try_number to avoid unnecessary retries. 
+                DEFAULT_RESCHEDULE_WINDOW = 2
+
+                current_time = timezone.utcnow()
+                recent_reschedule_window = timedelta(seconds=max_ti_poke_interval) if max_ti_poke_interval != 0 else timedelta(minutes=DEFAULT_RESCHEDULE_WINDOW)
+
+                reschedule_exists = exists().where(
+                    and_(
+                        TaskReschedule.ti_id == TI.id,
+                        TaskReschedule.reschedule_date > current_time - recent_reschedule_window,
+                        TaskReschedule.reschedule_date < current_time + recent_reschedule_window,
+                    )
+                )
+                
                 result = session.execute(
                     update(TI)
                     .where(TI.id.in_(id_chunk))
                     .values(
                         state=TaskInstanceState.SCHEDULED,
-                        scheduled_dttm=timezone.utcnow(),
+                        scheduled_dttm=current_time,
                         try_number=case(
                             (
-                                or_(TI.state.is_(None), TI.state != TaskInstanceState.UP_FOR_RESCHEDULE),
-                                TI.try_number + 1,
+                                or_(reschedule_exists, TI.state == TaskInstanceState.UP_FOR_RESCHEDULE),
+                                TI.try_number
                             ),
-                            else_=TI.try_number,
+                            else_=TI.try_number + 1,
                         ),
                     )
                     .execution_options(synchronize_session=False)

@@ -3079,6 +3079,60 @@ def test_teardown_and_fail_fast(dag_maker):
     }
 
 
+def test_schedule_tis_reschedule_does_not_increment_try_number(dag_maker, session: Session):
+    """
+    Test that rescheduled tasks (in reschedule mode) do not increment try_number
+    when scheduled again during the reschedule cycle.
+    
+    This addresses the bug where sensors with mode=reschedule were incorrectly
+    incrementing try_number on each poke, causing early failures and separate log files.
+    """
+    from airflow.models.taskreschedule import TaskReschedule
+    from airflow.utils.timezone import utcnow
+    
+    with dag_maker(session=session):
+        BaseOperator(task_id="task_1")
+
+    dr: DagRun = dag_maker.create_dagrun(session=session)
+    ti = dr.get_task_instance("task_1", session=session)
+    assert ti is not None
+    
+    # Schedule the task initially
+    dr.schedule_tis((ti,), session=session)
+    session.refresh(ti)
+    initial_try_number = ti.try_number
+    assert initial_try_number == 1
+    
+    # Set the state to UP_FOR_RESCHEDULE to simulate a rescheduled task
+    ti.state = TaskInstanceState.UP_FOR_RESCHEDULE
+    ti.try_number = 1
+    session.commit()
+    
+    # Create a TaskReschedule entry to indicate the task is still in reschedule cycle
+    reschedule = TaskReschedule(
+        ti_id=ti.id,
+        start_date=utcnow(),
+        end_date=utcnow(),
+        reschedule_date=utcnow(),
+    )
+    session.add(reschedule)
+    session.commit()
+    
+    # Refresh from DB
+    session.expire(ti)
+    ti = dr.get_task_instance("task_1", session=session)
+    
+    # Schedule the task again while it's UP_FOR_RESCHEDULE
+    dr.schedule_tis((ti,), session=session)
+    session.refresh(ti)
+    
+    # try_number should NOT be incremented because the task is rescheduled
+    assert ti.try_number == 1, (
+        f"try_number should not be incremented for rescheduled tasks. "
+        f"Expected: 1, Got: {ti.try_number}"
+    )
+
+
 class TestDagRunGetLastTi:
     def test_get_last_ti_with_multiple_tis(self, dag_maker, session):
         """Test get_last_ti returns the last TI (first created) when multiple TIs exist"""
